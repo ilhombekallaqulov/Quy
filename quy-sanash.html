@@ -20,8 +20,10 @@
   button { flex:1; padding:12px; font-size:16px; border:0; border-radius:10px; background:#2b6cff; color:#fff; }
   button.sec { background:#243041; }
   label { display:block; font-size:14px; margin:8px 0; }
+  select { width:100%; padding:10px; font-size:15px; background:#151c26; color:#fff; border:0; border-radius:8px; margin-top:4px; }
   input[type=range] { width:100%; }
-  #msg { font-size:14px; opacity:.8; margin:6px 0; min-height:20px; }
+  #msg { font-size:14px; opacity:.85; margin:6px 0; min-height:20px; }
+  #dbg { font-size:12px; opacity:.6; margin:4px 0 10px; min-height:16px; }
 </style>
 </head>
 <body>
@@ -37,6 +39,7 @@
     <div class="stat"><b id="sTot">0</b><span>Jami</span></div>
   </div>
   <div id="msg">Boshlash uchun tugmani bosing.</div>
+  <div id="dbg"></div>
   <div class="row">
     <button id="btnStart">Kamerani yoqish</button>
     <button id="btnReset" class="sec">Nolga qaytarish</button>
@@ -45,8 +48,14 @@
     <button id="btnDir" class="sec">Yo'nalishni almashtirish</button>
     <button id="btnLine" class="sec">Chiziq: gorizontal</button>
   </div>
-  <label>Aniqlik chegarasi: <span id="confVal">0.40</span>
-    <input type="range" id="conf" min="0.2" max="0.8" step="0.05" value="0.4">
+  <label>Model (kamerani yoqishdan oldin tanlang):
+    <select id="modelSel">
+      <option value="mobilenet_v2">Aniq (sekinroq, tavsiya)</option>
+      <option value="lite_mobilenet_v2">Tez (kamroq aniq)</option>
+    </select>
+  </label>
+  <label>Aniqlik chegarasi: <span id="confVal">0.30</span>
+    <input type="range" id="conf" min="0.15" max="0.8" step="0.05" value="0.3">
   </label>
   <label><input type="checkbox" id="allAnimals"> Boshqa hayvon nomlari bilan ham sanash (sigir, it, ot...)</label>
   <div style="font-size:13px;opacity:.65;margin-top:8px">
@@ -54,19 +63,43 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
 <script>
+// ---- Sun'iy intellekt alohida oqimda (worker) ishlaydi, shuning uchun kamera qotmaydi ----
+const WORKER_SRC = `
+let model = null;
+self.onmessage = async (e) => {
+  const m = e.data;
+  if (m.type === 'init') {
+    try {
+      importScripts('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0');
+      importScripts('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3');
+      await tf.ready();
+      model = await cocoSsd.load({ base: m.base });
+      postMessage({ type: 'ready', backend: tf.getBackend() });
+    } catch (err) { postMessage({ type: 'error', msg: String(err && err.message || err) }); }
+  } else if (m.type === 'frame') {
+    try {
+      const t0 = performance.now();
+      const preds = await model.detect(m.bitmap, 60);
+      m.bitmap.close();
+      postMessage({ type: 'dets', w: m.w, ms: performance.now() - t0,
+        preds: preds.map(p => ({ class: p.class, score: p.score, bbox: p.bbox })) });
+    } catch (err) { postMessage({ type: 'error', msg: String(err && err.message || err) }); }
+  }
+};
+`;
+
 const video = document.getElementById('video');
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const $ = id => document.getElementById(id);
 
-let model = null, running = false;
+let worker = null, running = false, busy = false, lastSend = 0;
 let tracks = [], nextId = 1, frame = 0;
 let cIn = 0, cOut = 0, flip = false, vertical = false;
 let A = {x:0,y:0}, B = {x:0,y:0};
 let dragging = null;
+let sentAt = 0;
 
 function setMsg(t){ $('msg').textContent = t; }
 
@@ -75,14 +108,11 @@ function setLineDefault(){
   if (vertical) { A = {x:w*0.5, y:h*0.1}; B = {x:w*0.5, y:h*0.9}; }
   else { A = {x:w*0.1, y:h*0.6}; B = {x:w*0.9, y:h*0.6}; }
 }
-
-function sideOf(p){
-  return (B.x-A.x)*(p.y-A.y) - (B.y-A.y)*(p.x-A.x);
-}
+function sideOf(p){ return (B.x-A.x)*(p.y-A.y) - (B.y-A.y)*(p.x-A.x); }
 function withinSegment(p){
   const dx=B.x-A.x, dy=B.y-A.y;
   const t=((p.x-A.x)*dx+(p.y-A.y)*dy)/(dx*dx+dy*dy);
-  return t>=-0.05 && t<=1.05;
+  return t>=-0.1 && t<=1.1;
 }
 
 async function start(){
@@ -90,7 +120,7 @@ async function start(){
   try {
     setMsg('Kamera ochilmoqda...');
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: {ideal:'environment'}, width:{ideal:960}, height:{ideal:540}, frameRate:{ideal:30} },
+      video: { facingMode: {ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:30} },
       audio: false
     });
     video.srcObject = stream;
@@ -100,53 +130,66 @@ async function start(){
     canvas.height = video.videoHeight;
     setLineDefault();
     try { if (navigator.wakeLock) await navigator.wakeLock.request('screen'); } catch(e){}
-    setMsg('Model yuklanmoqda (birinchi marta 10-20 soniya)...');
-    if (!model) model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-    running = true;
-    setMsg('Ishlayapti.');
-    $('btnStart').textContent = 'Ishlayapti';
-    loop();
+
+    setMsg('Model yuklanmoqda (birinchi marta 20-40 soniya)...');
+    const url = URL.createObjectURL(new Blob([WORKER_SRC], {type:'application/javascript'}));
+    worker = new Worker(url);
+    worker.onmessage = onWorker;
+    worker.postMessage({ type:'init', base: $('modelSel').value });
+    requestAnimationFrame(renderLoop);
   } catch (e) {
     setMsg('Xato: ' + e.message);
     $('btnStart').disabled = false;
   }
 }
 
-const dc = document.createElement('canvas');
-const dctx = dc.getContext('2d');
-
-async function loop(){
-  if (!running) return;
-  frame++;
-  let dets = [];
-  try {
-    // kichik nusxada aniqlash (tezroq), video esa silliq ko'rinib turadi
-    dc.width = 320;
-    dc.height = Math.round(320 * video.videoHeight / video.videoWidth);
-    dctx.drawImage(video, 0, 0, dc.width, dc.height);
-    const k = canvas.width / dc.width;
-    const preds = await model.detect(dc, 50);
+function onWorker(e){
+  const m = e.data;
+  if (m.type === 'ready') {
+    running = true;
+    setMsg('Ishlayapti. (' + m.backend + ')');
+    $('btnStart').textContent = 'Ishlayapti';
+  } else if (m.type === 'error') {
+    setMsg('Xato: ' + m.msg);
+    busy = false;
+  } else if (m.type === 'dets') {
+    const k = canvas.width / m.w;
     const th = parseFloat($('conf').value);
     const all = $('allAnimals').checked;
     const okClasses = all ? ['sheep','cow','dog','horse','cat','bear'] : ['sheep'];
-    dets = preds.filter(p => okClasses.includes(p.class) && p.score >= th)
+    const seen = {};
+    m.preds.forEach(p => { if (p.score >= 0.3) seen[p.class] = (seen[p.class]||0)+1; });
+    $('dbg').textContent = 'Ko\'rdi: ' + (Object.keys(seen).map(c => c+' '+seen[c]).join(', ') || 'hech narsa')
+      + '  |  ' + Math.round(m.ms) + ' ms';
+    const dets = m.preds.filter(p => okClasses.includes(p.class) && p.score >= th)
       .map(p => {
         const x=p.bbox[0]*k, y=p.bbox[1]*k, w=p.bbox[2]*k, h=p.bbox[3]*k;
         return { x, y, w, h, cx:x+w/2, cy:y+h/2 };
       });
-  } catch(e) { setMsg('Aniqlashda xato: ' + e.message); }
-  updateTracks(dets);
+    frame++;
+    updateTracks(dets);
+    busy = false;
+  }
+}
+
+function renderLoop(now){
+  // kadrlarni modelga yuborish (video silliq ko'rinib turadi)
+  if (running && !busy && video.videoWidth) {
+    busy = true;
+    const W = 512, H = Math.round(W * video.videoHeight / video.videoWidth);
+    createImageBitmap(video, { resizeWidth: W, resizeHeight: H, resizeQuality: 'low' })
+      .then(bmp => worker.postMessage({ type:'frame', bitmap:bmp, w:W }, [bmp]))
+      .catch(() => { busy = false; });
+  }
   draw();
-  // brauzerga nafas olish uchun biroz kutamiz
-  setTimeout(loop, 40);
+  requestAnimationFrame(renderLoop);
 }
 
 function updateTracks(dets){
-  // greedy nearest-centroid matching
   const pairs = [];
   tracks.forEach((t,ti) => dets.forEach((d,di) => {
     const dist = Math.hypot(t.cx-d.cx, t.cy-d.cy);
-    const lim = Math.max(d.w, d.h, t.w, t.h) * 0.9;
+    const lim = Math.max(d.w, d.h, t.w, t.h) * 1.2;
     if (dist < lim) pairs.push({ti, di, dist});
   }));
   pairs.sort((a,b) => a.dist-b.dist);
@@ -155,23 +198,22 @@ function updateTracks(dets){
     if (usedT.has(p.ti) || usedD.has(p.di)) continue;
     usedT.add(p.ti); usedD.add(p.di);
     const t = tracks[p.ti], d = dets[p.di];
-    const prev = {x:t.cx, y:t.cy};
-    const prevSide = sideOf(prev);
+    const prevSide = sideOf({x:t.cx, y:t.cy});
     t.cx = d.cx; t.cy = d.cy; t.w = d.w; t.h = d.h; t.x = d.x; t.y = d.y;
     t.missed = 0;
-    t.trail.push({x:t.cx,y:t.cy}); if (t.trail.length > 25) t.trail.shift();
+    t.trail.push({x:t.cx,y:t.cy}); if (t.trail.length > 10) t.trail.shift();
     const curSide = sideOf({x:t.cx,y:t.cy});
     if (prevSide !== 0 && Math.sign(prevSide) !== Math.sign(curSide)
-        && withinSegment({x:t.cx,y:t.cy}) && frame - t.lastCount > 8) {
+        && withinSegment({x:t.cx,y:t.cy}) && frame - t.lastCount > 2) {
       const goingIn = (prevSide > 0) !== flip;
       if (goingIn) cIn++; else cOut++;
       t.lastCount = frame;
-      t.flash = 10;
+      t.flash = 40;
       updateStats();
     }
   }
   tracks.forEach((t,ti) => { if (!usedT.has(ti)) t.missed++; });
-  tracks = tracks.filter(t => t.missed <= 15);
+  tracks = tracks.filter(t => t.missed <= 5);
   dets.forEach((d,di) => {
     if (usedD.has(di)) return;
     tracks.push({ id: nextId++, x:d.x, y:d.y, w:d.w, h:d.h, cx:d.cx, cy:d.cy,
@@ -187,6 +229,7 @@ function updateStats(){
 }
 
 function draw(){
+  if (!canvas.width) return;
   ctx.clearRect(0,0,canvas.width,canvas.height);
   const s = canvas.width/360;
   ctx.lineWidth = 2*s;
@@ -204,7 +247,6 @@ function draw(){
     ctx.fillStyle = '#fff'; ctx.font = (11*s)+'px sans-serif';
     ctx.fillText('#'+t.id, t.x+2, t.y-3);
   }
-  // line
   ctx.strokeStyle = '#2b6cff'; ctx.lineWidth = 3*s;
   ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(B.x,B.y); ctx.stroke();
   ctx.fillStyle = '#2b6cff';
@@ -212,7 +254,6 @@ function draw(){
   ctx.font = (14*s)+'px sans-serif';
   ctx.fillText('A', A.x-18*s, A.y-10*s);
   ctx.fillText('B', B.x+8*s, B.y-10*s);
-  // overlay
   ctx.fillStyle = 'rgba(0,0,0,.55)';
   ctx.fillRect(6,6,150*s,50*s);
   ctx.fillStyle = '#fff'; ctx.font = (14*s)+'px sans-serif';
@@ -220,7 +261,6 @@ function draw(){
   ctx.fillText('IN: '+cIn+'  OUT: '+cOut, 12*s, 46*s);
 }
 
-// drag A / B
 function toCanvas(e){
   const r = canvas.getBoundingClientRect();
   return { x:(e.clientX-r.left)*canvas.width/r.width, y:(e.clientY-r.top)*canvas.height/r.height };
@@ -236,13 +276,12 @@ canvas.addEventListener('pointermove', e => {
   const p = toCanvas(e);
   dragging.x = Math.max(0, Math.min(canvas.width, p.x));
   dragging.y = Math.max(0, Math.min(canvas.height, p.y));
-  if (!running) draw();
 });
 canvas.addEventListener('pointerup', () => { dragging = null; });
 
 $('btnStart').onclick = start;
 $('btnReset').onclick = () => { cIn = cOut = 0; tracks = []; updateStats(); };
-$('btnDir').onclick = () => { flip = !flip; setMsg('Yo\'nalish almashtirildi.'); };
+$('btnDir').onclick = () => { flip = !flip; setMsg("Yo'nalish almashtirildi."); };
 $('btnLine').onclick = () => {
   vertical = !vertical;
   $('btnLine').textContent = 'Chiziq: ' + (vertical ? 'vertikal' : 'gorizontal');
