@@ -90,7 +90,7 @@ async function start(){
   try {
     setMsg('Kamera ochilmoqda...');
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: {ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} },
+      video: { facingMode: {ideal:'environment'}, width:{ideal:960}, height:{ideal:540}, frameRate:{ideal:30} },
       audio: false
     });
     video.srcObject = stream;
@@ -112,22 +112,33 @@ async function start(){
   }
 }
 
+const dc = document.createElement('canvas');
+const dctx = dc.getContext('2d');
+
 async function loop(){
   if (!running) return;
   frame++;
   let dets = [];
   try {
-    const preds = await model.detect(video, 50);
+    // kichik nusxada aniqlash (tezroq), video esa silliq ko'rinib turadi
+    dc.width = 320;
+    dc.height = Math.round(320 * video.videoHeight / video.videoWidth);
+    dctx.drawImage(video, 0, 0, dc.width, dc.height);
+    const k = canvas.width / dc.width;
+    const preds = await model.detect(dc, 50);
     const th = parseFloat($('conf').value);
     const all = $('allAnimals').checked;
     const okClasses = all ? ['sheep','cow','dog','horse','cat','bear'] : ['sheep'];
     dets = preds.filter(p => okClasses.includes(p.class) && p.score >= th)
-      .map(p => ({ x:p.bbox[0], y:p.bbox[1], w:p.bbox[2], h:p.bbox[3],
-                   cx:p.bbox[0]+p.bbox[2]/2, cy:p.bbox[1]+p.bbox[3]/2 }));
+      .map(p => {
+        const x=p.bbox[0]*k, y=p.bbox[1]*k, w=p.bbox[2]*k, h=p.bbox[3]*k;
+        return { x, y, w, h, cx:x+w/2, cy:y+h/2 };
+      });
   } catch(e) { setMsg('Aniqlashda xato: ' + e.message); }
   updateTracks(dets);
   draw();
-  requestAnimationFrame(loop);
+  // brauzerga nafas olish uchun biroz kutamiz
+  setTimeout(loop, 40);
 }
 
 function updateTracks(dets){
