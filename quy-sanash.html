@@ -50,8 +50,21 @@
   </div>
   <label>Model (kamerani yoqishdan oldin tanlang):
     <select id="modelSel">
-      <option value="mobilenet_v2">Aniq (sekinroq, tavsiya)</option>
-      <option value="lite_mobilenet_v2">Tez (kamroq aniq)</option>
+      <option value="lite_mobilenet_v2">Yengil (tavsiya)</option>
+      <option value="mobilenet_v2">Aniq (og'irroq)</option>
+    </select>
+  </label>
+  <label>Hisoblash turi (kamerani yoqishdan oldin):
+    <select id="backendSel">
+      <option value="wasm">Protsessor (kamera silliq qoladi, tavsiya)</option>
+      <option value="webgl">Video karta (tezroq, lekin qotishi mumkin)</option>
+    </select>
+  </label>
+  <label>Tekshirish tezligi:
+    <select id="speedSel">
+      <option value="700">Tejamkor (sekundiga ~1.5 marta)</option>
+      <option value="400" selected>O'rtacha (sekundiga ~2.5 marta)</option>
+      <option value="150">Tez (telefon qizishi mumkin)</option>
     </select>
   </label>
   <label>Aniqlik chegarasi: <span id="confVal">0.30</span>
@@ -72,6 +85,13 @@ self.onmessage = async (e) => {
   if (m.type === 'init') {
     try {
       importScripts('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0');
+      if (m.backend === 'wasm') {
+        try {
+          importScripts('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js');
+          tf.wasm.setWasmPaths('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/');
+          await tf.setBackend('wasm');
+        } catch (e2) { await tf.setBackend('webgl'); }
+      }
       importScripts('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3');
       await tf.ready();
       model = await cocoSsd.load({ base: m.base });
@@ -135,7 +155,7 @@ async function start(){
     const url = URL.createObjectURL(new Blob([WORKER_SRC], {type:'application/javascript'}));
     worker = new Worker(url);
     worker.onmessage = onWorker;
-    worker.postMessage({ type:'init', base: $('modelSel').value });
+    worker.postMessage({ type:'init', base: $('modelSel').value, backend: $('backendSel').value });
     requestAnimationFrame(renderLoop);
   } catch (e) {
     setMsg('Xato: ' + e.message);
@@ -174,9 +194,10 @@ function onWorker(e){
 
 function renderLoop(now){
   // kadrlarni modelga yuborish (video silliq ko'rinib turadi)
-  if (running && !busy && video.videoWidth) {
+  if (running && !busy && video.videoWidth && now - lastSend >= parseInt($('speedSel').value)) {
     busy = true;
-    const W = 512, H = Math.round(W * video.videoHeight / video.videoWidth);
+    lastSend = now;
+    const W = 416, H = Math.round(W * video.videoHeight / video.videoWidth);
     createImageBitmap(video, { resizeWidth: W, resizeHeight: H, resizeQuality: 'low' })
       .then(bmp => worker.postMessage({ type:'frame', bitmap:bmp, w:W }, [bmp]))
       .catch(() => { busy = false; });
