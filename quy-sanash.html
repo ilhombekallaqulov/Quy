@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Qo'y sanagich</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#0b0f14; color:#e8eef5; font-family: system-ui, sans-serif; }
+  #wrap { position:relative; width:100%; background:#000; }
+  video, canvas { display:block; width:100%; height:auto; }
+  canvas { position:absolute; left:0; top:0; touch-action:none; }
+  #panel { padding:12px; }
+  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-bottom:12px; }
+  .stat { background:#151c26; border-radius:10px; padding:8px; text-align:center; }
+  .stat b { display:block; font-size:26px; }
+  .stat span { font-size:12px; opacity:.7; }
+  .row { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  button { flex:1; padding:12px; font-size:16px; border:0; border-radius:10px; background:#2b6cff; color:#fff; }
+  button.sec { background:#243041; }
+  label { display:block; font-size:14px; margin:8px 0; }
+  input[type=range] { width:100%; }
+  #msg { font-size:14px; opacity:.8; margin:6px 0; min-height:20px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="canvas"></canvas>
+</div>
+<div id="panel">
+  <div class="stats">
+    <div class="stat"><b id="sCur">0</b><span>Hozir kadrda</span></div>
+    <div class="stat"><b id="sIn">0</b><span>IN</span></div>
+    <div class="stat"><b id="sOut">0</b><span>OUT</span></div>
+    <div class="stat"><b id="sTot">0</b><span>Jami</span></div>
+  </div>
+  <div id="msg">Boshlash uchun tugmani bosing.</div>
+  <div class="row">
+    <button id="btnStart">Kamerani yoqish</button>
+    <button id="btnReset" class="sec">Nolga qaytarish</button>
+  </div>
+  <div class="row">
+    <button id="btnDir" class="sec">Yo'nalishni almashtirish</button>
+    <button id="btnLine" class="sec">Chiziq: gorizontal</button>
+  </div>
+  <label>Aniqlik chegarasi: <span id="confVal">0.40</span>
+    <input type="range" id="conf" min="0.2" max="0.8" step="0.05" value="0.4">
+  </label>
+  <label><input type="checkbox" id="allAnimals"> Boshqa hayvon nomlari bilan ham sanash (sigir, it, ot...)</label>
+  <div style="font-size:13px;opacity:.65;margin-top:8px">
+    Ko'k chiziqning A va B nuqtalarini barmoq bilan suring. Qo'ylar chiziqdan o'tganda sanaladi.
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const $ = id => document.getElementById(id);
+
+let model = null, running = false;
+let tracks = [], nextId = 1, frame = 0;
+let cIn = 0, cOut = 0, flip = false, vertical = false;
+let A = {x:0,y:0}, B = {x:0,y:0};
+let dragging = null;
+
+function setMsg(t){ $('msg').textContent = t; }
+
+function setLineDefault(){
+  const w = canvas.width, h = canvas.height;
+  if (vertical) { A = {x:w*0.5, y:h*0.1}; B = {x:w*0.5, y:h*0.9}; }
+  else { A = {x:w*0.1, y:h*0.6}; B = {x:w*0.9, y:h*0.6}; }
+}
+
+function sideOf(p){
+  return (B.x-A.x)*(p.y-A.y) - (B.y-A.y)*(p.x-A.x);
+}
+function withinSegment(p){
+  const dx=B.x-A.x, dy=B.y-A.y;
+  const t=((p.x-A.x)*dx+(p.y-A.y)*dy)/(dx*dx+dy*dy);
+  return t>=-0.05 && t<=1.05;
+}
+
+async function start(){
+  $('btnStart').disabled = true;
+  try {
+    setMsg('Kamera ochilmoqda...');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: {ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    await new Promise(r => { if (video.videoWidth) r(); else video.onloadedmetadata = r; });
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    setLineDefault();
+    try { if (navigator.wakeLock) await navigator.wakeLock.request('screen'); } catch(e){}
+    setMsg('Model yuklanmoqda (birinchi marta 10-20 soniya)...');
+    if (!model) model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    running = true;
+    setMsg('Ishlayapti.');
+    $('btnStart').textContent = 'Ishlayapti';
+    loop();
+  } catch (e) {
+    setMsg('Xato: ' + e.message);
+    $('btnStart').disabled = false;
+  }
+}
+
+async function loop(){
+  if (!running) return;
+  frame++;
+  let dets = [];
+  try {
+    const preds = await model.detect(video, 50);
+    const th = parseFloat($('conf').value);
+    const all = $('allAnimals').checked;
+    const okClasses = all ? ['sheep','cow','dog','horse','cat','bear'] : ['sheep'];
+    dets = preds.filter(p => okClasses.includes(p.class) && p.score >= th)
+      .map(p => ({ x:p.bbox[0], y:p.bbox[1], w:p.bbox[2], h:p.bbox[3],
+                   cx:p.bbox[0]+p.bbox[2]/2, cy:p.bbox[1]+p.bbox[3]/2 }));
+  } catch(e) { setMsg('Aniqlashda xato: ' + e.message); }
+  updateTracks(dets);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function updateTracks(dets){
+  // greedy nearest-centroid matching
+  const pairs = [];
+  tracks.forEach((t,ti) => dets.forEach((d,di) => {
+    const dist = Math.hypot(t.cx-d.cx, t.cy-d.cy);
+    const lim = Math.max(d.w, d.h, t.w, t.h) * 0.9;
+    if (dist < lim) pairs.push({ti, di, dist});
+  }));
+  pairs.sort((a,b) => a.dist-b.dist);
+  const usedT = new Set(), usedD = new Set();
+  for (const p of pairs){
+    if (usedT.has(p.ti) || usedD.has(p.di)) continue;
+    usedT.add(p.ti); usedD.add(p.di);
+    const t = tracks[p.ti], d = dets[p.di];
+    const prev = {x:t.cx, y:t.cy};
+    const prevSide = sideOf(prev);
+    t.cx = d.cx; t.cy = d.cy; t.w = d.w; t.h = d.h; t.x = d.x; t.y = d.y;
+    t.missed = 0;
+    t.trail.push({x:t.cx,y:t.cy}); if (t.trail.length > 25) t.trail.shift();
+    const curSide = sideOf({x:t.cx,y:t.cy});
+    if (prevSide !== 0 && Math.sign(prevSide) !== Math.sign(curSide)
+        && withinSegment({x:t.cx,y:t.cy}) && frame - t.lastCount > 8) {
+      const goingIn = (prevSide > 0) !== flip;
+      if (goingIn) cIn++; else cOut++;
+      t.lastCount = frame;
+      t.flash = 10;
+      updateStats();
+    }
+  }
+  tracks.forEach((t,ti) => { if (!usedT.has(ti)) t.missed++; });
+  tracks = tracks.filter(t => t.missed <= 15);
+  dets.forEach((d,di) => {
+    if (usedD.has(di)) return;
+    tracks.push({ id: nextId++, x:d.x, y:d.y, w:d.w, h:d.h, cx:d.cx, cy:d.cy,
+                  missed:0, lastCount:-100, flash:0, trail:[{x:d.cx,y:d.cy}] });
+  });
+  $('sCur').textContent = dets.length;
+}
+
+function updateStats(){
+  $('sIn').textContent = cIn;
+  $('sOut').textContent = cOut;
+  $('sTot').textContent = cIn + cOut;
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const s = canvas.width/360;
+  ctx.lineWidth = 2*s;
+  for (const t of tracks){
+    if (t.missed > 0) continue;
+    ctx.strokeStyle = t.flash > 0 ? '#ffd400' : '#22dd44';
+    if (t.flash > 0) t.flash--;
+    ctx.strokeRect(t.x, t.y, t.w, t.h);
+    ctx.strokeStyle = '#ffe000';
+    ctx.beginPath();
+    t.trail.forEach((p,i) => i ? ctx.lineTo(p.x,p.y) : ctx.moveTo(p.x,p.y));
+    ctx.stroke();
+    ctx.fillStyle = '#ff2bd6';
+    ctx.beginPath(); ctx.arc(t.cx, t.cy, 4*s, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = (11*s)+'px sans-serif';
+    ctx.fillText('#'+t.id, t.x+2, t.y-3);
+  }
+  // line
+  ctx.strokeStyle = '#2b6cff'; ctx.lineWidth = 3*s;
+  ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(B.x,B.y); ctx.stroke();
+  ctx.fillStyle = '#2b6cff';
+  [A,B].forEach(p => { ctx.beginPath(); ctx.arc(p.x,p.y,8*s,0,7); ctx.fill(); });
+  ctx.font = (14*s)+'px sans-serif';
+  ctx.fillText('A', A.x-18*s, A.y-10*s);
+  ctx.fillText('B', B.x+8*s, B.y-10*s);
+  // overlay
+  ctx.fillStyle = 'rgba(0,0,0,.55)';
+  ctx.fillRect(6,6,150*s,50*s);
+  ctx.fillStyle = '#fff'; ctx.font = (14*s)+'px sans-serif';
+  ctx.fillText('Jami: '+(cIn+cOut), 12*s, 24*s);
+  ctx.fillText('IN: '+cIn+'  OUT: '+cOut, 12*s, 46*s);
+}
+
+// drag A / B
+function toCanvas(e){
+  const r = canvas.getBoundingClientRect();
+  return { x:(e.clientX-r.left)*canvas.width/r.width, y:(e.clientY-r.top)*canvas.height/r.height };
+}
+canvas.addEventListener('pointerdown', e => {
+  const p = toCanvas(e);
+  const lim = canvas.width*0.1;
+  const da = Math.hypot(p.x-A.x,p.y-A.y), db = Math.hypot(p.x-B.x,p.y-B.y);
+  if (Math.min(da,db) < lim) { dragging = da < db ? A : B; canvas.setPointerCapture(e.pointerId); }
+});
+canvas.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const p = toCanvas(e);
+  dragging.x = Math.max(0, Math.min(canvas.width, p.x));
+  dragging.y = Math.max(0, Math.min(canvas.height, p.y));
+  if (!running) draw();
+});
+canvas.addEventListener('pointerup', () => { dragging = null; });
+
+$('btnStart').onclick = start;
+$('btnReset').onclick = () => { cIn = cOut = 0; tracks = []; updateStats(); };
+$('btnDir').onclick = () => { flip = !flip; setMsg('Yo\'nalish almashtirildi.'); };
+$('btnLine').onclick = () => {
+  vertical = !vertical;
+  $('btnLine').textContent = 'Chiziq: ' + (vertical ? 'vertikal' : 'gorizontal');
+  setLineDefault();
+};
+$('conf').oninput = e => { $('confVal').textContent = parseFloat(e.target.value).toFixed(2); };
+</script>
+</body>
+</html>
